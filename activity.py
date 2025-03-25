@@ -937,6 +937,41 @@ class SpeakActivity(activity.Activity):
             self._entrycombo.set_active(index)
             self._entry.select_region(0, -1)
             return True
+        
+        # Adding keyboard shortcuts for common actions
+        elif event.state & Gdk.ModifierType.CONTROL_MASK:
+            #Ctrl+S -> Speaks the current text
+            if keyname == 's':
+                text = self._entry.get_text()
+                self._speak_the_text(self._entry, text)
+                return True
+
+            # Ctrl+1 -> Switch to speak mode
+            elif keyname == '1':
+                self._mode_type.set_active(True)
+                return True
+            
+            # Ctrl+2 -> Switch to chatbot mode
+            elif keyname == '2':
+                self._mode_robot.set_active(True)
+                return True
+
+            # Ctrl+P -> Toggle pitch adjustment slider
+            elif keyname == 'p':
+                self._voice_toolbar_button.clicked()
+                return True
+            
+            # Ctrl+M -> Cycle through mouth types
+            elif keyname == 'm':
+                active_index = -1
+                for i, button in enumerate(self._mouth_type):
+                    if button.get_active():
+                        active_index = i
+                        break
+                
+                next_index = (active_index + 1) % len(self._mouth_type)
+                self._mouth_type[next_index].set_active(True)
+                return True
         return False
 
     def _entry_activate_cb(self, entry):
