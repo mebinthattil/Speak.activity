@@ -16,20 +16,17 @@
 # Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 
 import numpy
-
+from kokoro import KPipeline
+import tempfile
+import os
 from gi.repository import Gst
 from gi.repository import GLib
 from gi.repository import GObject
-
 import logging
 logger = logging.getLogger('speak')
-
 from sugar3.speech import GstSpeechPlayer
-
-PITCH_MIN = 0
-PITCH_MAX = 200
-RATE_MIN = 0
-RATE_MAX = 200
+import soundfile as sf
+from kokoro.pipeline import LANG_CODES
 
 
 class Speech(GstSpeechPlayer):
@@ -64,129 +61,54 @@ class Speech(GstSpeechPlayer):
         self._cb['idle'] = self.connect('idle', cb)
 
     def make_pipeline(self):
-        if self.pipeline is not None:
-            self.stop_sound_device()
-            del self.pipeline
-
-        # build a pipeline that makes speech
-        # and sends it to both the audio output
-        # and a fake one that we use to draw from
-        cmd = 'espeak name=espeak' \
-            ' ! capsfilter name=caps' \
-            ' ! tee name=me' \
-            ' me.! queue ! autoaudiosink name=ears' \
-            ' me.! queue ! fakesink name=sink'
-        self.pipeline = Gst.parse_launch(cmd)
-
-        # force a sample bit width to match our numpy code below
-        caps = self.pipeline.get_by_name('caps')
-        want = 'audio/x-raw,channels=(int)1,depth=(int)16'
-        caps.set_property('caps', Gst.caps_from_string(want))
-
-        # grab reference to the output element for scheduling mouth moves
-        ears = self.pipeline.get_by_name('ears')
-
-        def handoff(element, data, pad):
-            size = data.get_size()
-            if size == 0 or data.duration == 0:
-                return True  # common
-
-            npc = 50000000  # nanoseconds per chunk
-            bpc = size * npc // data.duration  # bytes per chunk
-            bpc = bpc // 2 * 2  # force alignment for int16
-
-            a = []
-            p = []
-            w = []
-
-            here = 0  # offset in bytes
-            when = data.pts
-            last = data.pts + data.duration
-            while True:
-                wave = numpy.fromstring(data.extract_dup(here, bpc), 'int16')
-                peak = numpy.core.max(wave)
-
-                a.append(wave)
-                p.append(peak)
-                w.append(when)
-
-                here += bpc
-                when += npc
-                if when < last:
-                    continue
-                break
-
-            def poke(pts):
-                success, position = ears.query_position(Gst.Format.TIME)
-                if not success:
-                    return False
-
-                if len(w) == 0:
-                    return False
-
-                if position < w[0]:
-                    return True
-
-                self.emit("wave", a[0])
-                self.emit("peak", p[0])
-                del a[0]
-                del w[0]
-                del p[0]
-
-                if len(w) > 0:
-                    return True
-
-                return False
-
-            GLib.timeout_add(25, poke, data.pts)
-
-            return True
-
-        sink = self.pipeline.get_by_name('sink')
-        sink.props.signal_handoffs = True
-        sink.connect('handoff', handoff)
-
-        def gst_message_cb(bus, message):
-            self._was_message = True
-
-            if message.type == Gst.MessageType.WARNING:
-                def check_after_warnings():
-                    if not self._was_message:
-                        self.stop_sound_device()
-                    return True
-
-                logger.debug(message.type)
-                self._was_message = False
-                GLib.timeout_add(500, check_after_warnings)
-
-            elif message.type in (Gst.MessageType.EOS, Gst.MessageType.ERROR):
-                logger.debug(message.type)
-                self.stop_sound_device()
-            return True
-
-        self._was_message = False
-        bus = self.pipeline.get_bus()
-        bus.add_signal_watch()
-        bus.connect('message', gst_message_cb)
+        #kokoro handles TTS, no pipeline needed - TODO: in future i have to introduce streaming, for that pipeline is needed
+        self.pipeline = None
 
     def speak(self, status, text):
-        self.make_pipeline()
-        src = self.pipeline.get_by_name('espeak')
+        voice = getattr(status.voice, 'name', None)
+        pitch = getattr(status, 'pitch', 100)
+        rate = getattr(status, 'rate', 100)
+        # Robustly map to kokoro lang_code
+        lang_code = 'a'  # default
+        if voice:
+            v = voice.split('_')[0].lower()
+            if v in LANG_CODES:
+                lang_code = v
+            else:
+                for code, name in LANG_CODES.items():
+                    if v in name.lower() or v in code:
+                        lang_code = code
+                        break
+        # Fallback to a known working voice if not valid
+        valid_voices = ['af_heart', 'af_bella']  
+        if not voice or voice.lower() not in valid_voices:
+            voice = 'af_heart'
+        pipeline = KPipeline(lang_code=lang_code)
+        speed = max(0.5, min(2.0, rate / 100.0))
+        for result in pipeline(text, voice=voice, speed=speed):
+            if result.audio is not None:
+                audio = result.audio.cpu().numpy() if hasattr(result.audio, 'cpu') else result.audio
+                # Save to a temporary WAV file
+                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmpfile:
+                    sf.write(tmpfile.name, audio, 24000)
+                    tmpfile.flush()
+                    # Play with GStreamer
+                    self._play_wav_with_gst(tmpfile.name)
+                    os.unlink(tmpfile.name)
+                break
 
-        pitch = int(status.pitch) - 100
-        rate = int(status.rate) - 100
-
-        logger.debug('pitch=%d rate=%d voice=%s text=%s' % (pitch, rate,
-                                                            status.voice.name,
-                                                            text))
-
-        src.props.pitch = pitch
-        src.props.rate = rate
-        src.props.voice = status.voice.name
-        src.props.track = 1
-        src.props.text = text
-
-        self.restart_sound_device()
+    def _play_wav_with_gst(self, wav_path):
+        # Use GStreamer to play the WAV file
+        pipeline_str = f'filesrc location="{wav_path}" ! wavparse ! audioconvert ! audioresample ! autoaudiosink'
+        pipeline = Gst.parse_launch(pipeline_str)
+        pipeline.set_state(Gst.State.PLAYING)
+        # Wait for EOS or ERROR
+        bus = pipeline.get_bus()
+        while True:
+            msg = bus.timed_pop_filtered(10 * Gst.SECOND, Gst.MessageType.EOS | Gst.MessageType.ERROR)
+            if msg:
+                break
+        pipeline.set_state(Gst.State.NULL)
 
 
 _speech = None
@@ -199,3 +121,8 @@ def get_speech():
         _speech = Speech()
 
     return _speech
+
+PITCH_MIN = 0
+PITCH_MAX = 200
+RATE_MIN = 0
+RATE_MAX = 200

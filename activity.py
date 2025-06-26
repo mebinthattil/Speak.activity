@@ -1014,6 +1014,7 @@ class SpeakActivity(activity.Activity):
         text = self._entry.props.text
         self._speak_the_text(self._entry, text)
 
+
     def _speak_the_text(self, entry, text):
         self._remove_idle()
 
@@ -1024,6 +1025,7 @@ class SpeakActivity(activity.Activity):
             if self._mode == MODE_BOT:
                 self.face.say(brain.respond(text))
             else:
+
                 self.face.say(text)
 
         if text and not self._tablet_mode:
