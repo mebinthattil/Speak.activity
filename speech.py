@@ -1,5 +1,6 @@
 # Copyright (C) 2009, Aleksey Lim
 # Copyright (C) 2019, Chihurumnaya Ibiam <ibiamchihurumnaya@sugarlabs.org>
+# Copyright (C) 2025, Mebin J Thattil <mail@mebin.in>
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -25,6 +26,14 @@ import logging
 logger = logging.getLogger('speak')
 
 from sugar3.speech import GstSpeechPlayer
+
+# Try importing Kokoro TTS (else we fallback to espeak)
+try:
+    from kokoro import KPipeline
+    KOKORO_AVAILABLE = True
+except ImportError:
+    KOKORO_AVAILABLE = False
+    logger.warning("Kokoro not available, falling back to espeak")
 
 PITCH_MIN = 0
 PITCH_MAX = 200
@@ -68,14 +77,29 @@ class Speech(GstSpeechPlayer):
             self.stop_sound_device()
             del self.pipeline
 
-        # build a pipeline that makes speech
-        # and sends it to both the audio output
-        # and a fake one that we use to draw from
-        cmd = 'espeak name=espeak' \
-            ' ! capsfilter name=caps' \
-            ' ! tee name=me' \
-            ' me.! queue ! autoaudiosink name=ears' \
-            ' me.! queue ! fakesink name=sink'
+        # If kokoro is available build pipeline using kokoro, else use espeak
+        # The pipeline has two sinks : `ears` & `fakesink`
+        # ears play to the audio device - we hear the sound output from Kokoro / espeak
+        # fakesink is used to draw the mouth movements
+
+        if KOKORO_AVAILABLE and self.kokoro_pipeline:
+            # Build pipeline for Kokoro using appsrc
+            # fakesink audio converted to S16LE 16KHz so it's backward compatable with the previous mouth drawing logic
+            cmd = 'appsrc name=kokoro_src' \
+                ' ! audioconvert' \
+                ' ! audio/x-raw,channels=(int)1,format=F32LE,rate=24000' \
+                ' ! tee name=me' \
+                ' me.! queue ! autoaudiosink name=ears' \
+                ' me.! queue ! audioconvert ! audioresample ! audio/x-raw,format=S16LE,channels=1,rate=16000 ! fakesink name=sink'
+            
+        else:
+            # Fallback to espeak pipeline
+            cmd = 'espeak name=espeak' \
+                ' ! capsfilter name=caps' \
+                ' ! tee name=me' \
+                ' me.! queue ! autoaudiosink name=ears' \
+                ' me.! queue ! fakesink name=sink'
+            
         self.pipeline = Gst.parse_launch(cmd)
 
         # force a sample bit width to match our numpy code below
@@ -88,23 +112,64 @@ class Speech(GstSpeechPlayer):
 
         def handoff(element, data, pad):
             size = data.get_size()
-            if size == 0 or data.duration == 0:
-                return True  # common
+            
+            if size == 0: #skip if size = 0
+                logger.debug("Size is equal to zero, skipping handoff")
+                return True
 
-            npc = 50000000  # nanoseconds per chunk
-            bpc = size * npc // data.duration  # bytes per chunk
+            # Handle invalid duration
+            if data.duration == 0 or data.duration == Gst.CLOCK_TIME_NONE or data.duration > Gst.SECOND * 10:
+                logger.debug("Invalid duration detected, using fallback duration calculation")
+                # Assume 16-bit, 1 channel, 16000 Hz for duration calculation
+                SAMPLE_RATE = 16000
+                samples = size // 2  # 16-bit = 2 bytes per sample
+                fallback_duration = samples * Gst.SECOND // SAMPLE_RATE
+                actual_duration = fallback_duration
+            else:
+                actual_duration = data.duration
+
+            npc = 50000000  # npc - nanoseconds per chunk; here 50ms audio = 1 chunks
+            bpc = size * npc // actual_duration  # bytes per chunk
             bpc = bpc // 2 * 2  # force alignment for int16
 
-            a = []
-            p = []
-            w = []
+            # Ensuring minimum chunk size
+            if bpc == 0:
+                bpc = min(4096, size)  # I think 4096 is a reasonable chunk size, if not will change later.
+                bpc = bpc // 2 * 2  # force alignment for int16
+
+            a = [] # list of waveform data
+            p = [] # list of peak values, representing absolute amplitude
+            w = [] # list of timestamps for corresponding chunk
 
             here = 0  # offset in bytes
             when = data.pts
             last = data.pts + data.duration
             while True:
-                wave = numpy.fromstring(data.extract_dup(here, bpc), 'int16')
-                peak = numpy.core.max(wave)
+                try:
+                    # Extract raw bytes from the buffer
+                    # `extract_dup` -> Extracts a copy of at most size bytes the data at offset into newly-allocated memory. (from docs)
+                    raw_bytes = data.extract_dup(here, bpc)
+                    
+                    if len(raw_bytes) == 0: # Handling case when chunk is empty - this happens sometimes.
+                        logger.debug("Empty audio chunk - breaking")
+                        break
+                    
+                    # Convert to int16 array
+                    wave = numpy.frombuffer(raw_bytes, dtype='int16')
+                    if len(wave) == 0:
+                        logger.debug("Empty wave array after conversion - breaking")
+                        break
+                        
+                    peak = numpy.max(numpy.abs(wave))
+                    logger.debug(f"Processed wave chunk: length={len(wave)}, peak={peak}")
+
+                except (ValueError, TypeError) as e:
+                    logger.warning(f"Error processing audio data for lip sync: {e}")
+                    break
+
+                except Exception as e:
+                    logger.error(f"Unexpected error in handoff function: {e}")
+                    break
 
                 a.append(wave)
                 p.append(peak)
@@ -119,6 +184,20 @@ class Speech(GstSpeechPlayer):
             def poke(pts):
                 success, position = ears.query_position(Gst.Format.TIME)
                 if not success:
+                    logger.debug("Position query failed, using fallback timing")
+
+                    # Fallback: emit one chunk per tick, re-schedule until done
+                    if len(w) > 0:
+                        logger.debug(f"Emitting signals (fallback): wave length={len(a[0])}, peak={p[0]}")
+                        self.emit("wave", a[0])
+                        self.emit("peak", p[0])
+                        del a[0]
+                        del w[0]
+                        del p[0]
+                        # Re-schedule timer if more chunks remain
+                        if len(w) > 0:
+                            GLib.timeout_add(25, poke, pts)
+                        return False
                     return False
 
                 if len(w) == 0:
@@ -138,7 +217,34 @@ class Speech(GstSpeechPlayer):
 
                 return False
 
-            GLib.timeout_add(25, poke, data.pts)
+            # Calculate interval so that all chunks are spread evenly over the audio duration
+            total_chunks = len(a)
+            if total_chunks > 0:
+                # `actual_duration` -> duration of audio buffer in nanoseconds
+                # `total_chunks` -> number of chunks the buffer was split into
+                # so `actual_duration / total_chunks` will give us the duration in nanosecond per chunk
+                # and ensuring interval never smaller than 10 to avoid rapid updates, it looks odd.
+                interval_ms = max(10, int(actual_duration / total_chunks / 1000000))
+            else:
+                interval_ms = 25  # fallback default
+
+            def emit_next_chunk():
+                if len(a) > 0:
+                    self.emit("wave", a[0])
+                    self.emit("peak", p[0])
+                    del a[0]
+                    del p[0]
+                    del w[0]
+                    if len(a) > 0:
+                        GLib.timeout_add(interval_ms, emit_next_chunk)
+                    return False
+                return False
+
+            # For Kokoro, use time-based emission since position queries will fail while streaming in chunks
+            if KOKORO_AVAILABLE and self.kokoro_pipeline:
+                GLib.timeout_add(interval_ms, emit_next_chunk)
+            else:
+                GLib.timeout_add(25, poke, data.pts)
 
             return True
 
@@ -169,12 +275,59 @@ class Speech(GstSpeechPlayer):
         bus.add_signal_watch()
         bus.connect('message', gst_message_cb)
 
+    def _stream_kokoro_audio(self, text, voice):
+        """Stream Kokoro audio chunks to the GStreamer pipeline"""
+        try:
+            # Getting the appsrc element
+            appsrc = self.pipeline.get_by_name('kokoro_src')
+            if not appsrc:
+                logger.error("Could not find kokoro_src element")
+                return
+            
+            # Set caps for Kokoro audio
+            caps = Gst.Caps.from_string(
+                "audio/x-raw,format=F32LE,layout=interleaved,rate=24000,channels=1"
+            )
+            appsrc.set_property("caps", caps)
+
+            audio_generator = self.kokoro_pipeline(text, voice=voice) # actual audio generation by kokoro
+
+            # Stream audio chunks
+            for i, (gs, ps, audio_chunk) in enumerate(audio_generator):
+                # Convert tensor to numpy array then to bytes
+                data_bytes = audio_chunk.numpy().tobytes()
+                
+                # Create GStreamer buffer
+                buf = Gst.Buffer.new_wrapped(data_bytes)
+                
+                # Push buffer to appsrc
+                ret = appsrc.emit("push-buffer", buf)
+                if ret != Gst.FlowReturn.OK:
+                    logger.error(f"Error pushing buffer {i} to GStreamer")
+                    break
+
+            appsrc.emit("end-of-stream") # Signal EOS
+            
+        except Exception as e:
+            # Signalling EOS here as well, but I'm adding error to logs
+            logger.error(f"Error in Kokoro audio streaming: {e}")
+            if appsrc:
+                appsrc.emit("end-of-stream")
+
     def speak(self, status, text):
         self.make_pipeline()
-        src = self.pipeline.get_by_name('espeak')
-
-        pitch = int(status.pitch) - 100
-        rate = int(status.rate) - 100
+        
+        if KOKORO_AVAILABLE and self.kokoro_pipeline:
+            logger.debug('Using Kokoro TTS: voice=%s text=%s' % (self.current_kokoro_voice, text))
+            self.restart_sound_device()
+            self._stream_kokoro_audio(text, self.current_kokoro_voice)
+            
+        else:
+            # Fallback to espeak
+            src = self.pipeline.get_by_name('espeak')
+            
+            pitch = int(status.pitch) - 100
+            rate = int(status.rate) - 100
 
         logger.debug('pitch=%d rate=%d voice=%s text=%s' % (pitch, rate,
                                                             status.voice.name,
